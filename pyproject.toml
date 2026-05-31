@@ -8,8 +8,12 @@ dependencies = [
     "pyyaml>=6.0",
     "numpy",
     "opencv-python",
+    "pyquaternion>=0.9.9",
     "pytest",
     "tensorboard",
+    "timm",
+    "einops",
+    "nuplan-devkit @ git+https://github.com/motional/nuplan-devkit@nuplan-devkit-v1.2",
 ]
 
 # Install torch CUDA build with:

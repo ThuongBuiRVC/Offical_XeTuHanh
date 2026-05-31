@@ -266,7 +266,7 @@ def train(cfg, resume: str | None = None, epochs: int | None = None, max_steps_o
                 losses = forward_and_loss(model, batch, weights, cfg, device)
             (losses["total"] / accum).backward()
             for key, value in losses.items():
-                step_losses[key] = step_losses.get(key, 0.0) + float(value) / accum
+                step_losses[key] = step_losses.get(key, 0.0) + float(value.detach()) / accum
 
         torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], cfg.optim.grad_clip

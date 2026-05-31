@@ -17,7 +17,7 @@ dims:
 
 # ---------------- V-JEPA backbone (SPEC §2, FROZEN) ----------------
 vjepa:
-  model_name: vit_base            # V-JEPA 2.1 ViT-B/16
+  model_name: vjepa2_1_vit_base_384  # V-JEPA 2.1 ViT-B/16 @384
   img_size: 384
   num_frames: 8
   tubelet_size: 2

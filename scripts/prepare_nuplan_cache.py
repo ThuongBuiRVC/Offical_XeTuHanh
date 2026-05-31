@@ -43,13 +43,16 @@ import csv
 import hashlib
 import inspect
 import json
+import sqlite3
 from pathlib import Path
 
 import numpy as np
 import torch
+from pyquaternion import Quaternion
 
 from src.config import load_config
 from src.data.navsim_features import FeatureSpec, build_training_sample
+from src.data.navsim_features import preprocess_camera
 
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +153,243 @@ def select_tokens(tokens, holdout_frac: float, holdout_side: str):
 
 
 # --------------------------------------------------------------------------- #
+# Direct nuPlan DB fallback (for local DB + camera shard smoke/prep)
+# --------------------------------------------------------------------------- #
+def has_nuplan_db_logs(log_path: Path) -> bool:
+    return log_path.is_dir() and any(log_path.glob("*.db"))
+
+
+def yaw_from_quaternion(qw: float, qx: float, qy: float, qz: float) -> float:
+    return float(Quaternion(qw, qx, qy, qz).yaw_pitch_roll[0])
+
+
+def rotation_world_to_local(yaw: float) -> np.ndarray:
+    c, s = np.cos(yaw), np.sin(yaw)
+    return np.asarray([[c, s], [-s, c]], dtype=np.float32)
+
+
+def resample_indices(length: int, n: int) -> np.ndarray:
+    if length <= 0:
+        raise ValueError("empty sequence")
+    if length == n:
+        return np.arange(n)
+    return np.rint(np.linspace(0, length - 1, n)).astype(np.int64)
+
+
+def candidate_camera_roots(sensor_path: Path) -> list[Path]:
+    if sensor_path.name.startswith("nuplan-v1.1_"):
+        roots = sorted(sensor_path.parent.glob("nuplan-v1.1_*_camera_*"))
+        return [sensor_path] + [root for root in roots if root != sensor_path]
+    roots = sorted(sensor_path.glob("nuplan-v1.1_*_camera_*"))
+    return roots if roots else [sensor_path]
+
+
+def resolve_camera_path(sensor_path: Path, rel_path: str, cache: dict[str, Path]) -> Path:
+    log_name = rel_path.split("/", 1)[0]
+    if log_name in cache:
+        path = cache[log_name] / rel_path
+        if path.exists():
+            return path
+    for root in candidate_camera_roots(sensor_path):
+        path = root / rel_path
+        if path.exists():
+            cache[log_name] = root
+            return path
+    raise FileNotFoundError(f"camera image not found for {rel_path} under {sensor_path}")
+
+
+def load_rgb_image(path: Path) -> np.ndarray:
+    import cv2
+
+    image_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise ValueError(f"failed to read image: {path}")
+    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+
+def query_cam_f0_rows(db_path: Path) -> list[dict]:
+    query = """
+        select image.filename_jpg, image.timestamp,
+               ego_pose.x, ego_pose.y, ego_pose.qw, ego_pose.qx, ego_pose.qy, ego_pose.qz,
+               ego_pose.vx, ego_pose.vy, ego_pose.acceleration_x, ego_pose.acceleration_y
+        from image
+        join camera on image.camera_token = camera.token
+        join ego_pose on image.ego_pose_token = ego_pose.token
+        where camera.channel = 'CAM_F0'
+        order by image.timestamp
+    """
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        return [dict(row) for row in con.execute(query)]
+
+
+def build_db_sample(db_path: Path, sensor_path: Path, spec: FeatureSpec, store_dtype: torch.dtype) -> dict:
+    rows = query_cam_f0_rows(db_path)
+    required_frames = spec.n_past + max(spec.n_fut, spec.n_act)
+    if len(rows) < required_frames:
+        raise ValueError(f"{db_path.name}: only {len(rows)} CAM_F0 frames, need {required_frames}")
+
+    # nuPlan image DBs are ~10Hz. Use every 5th frame for NAVSIM's 2Hz convention.
+    stride = 5
+    usable = rows[::stride]
+    if len(usable) < required_frames:
+        stride = max(1, len(rows) // required_frames)
+        usable = rows[::stride]
+    if len(usable) < required_frames:
+        raise ValueError(f"{db_path.name}: only {len(usable)} sampled frames, need {required_frames}")
+
+    current_idx = spec.n_past - 1
+    selected = usable[:required_frames]
+    past_rows = selected[:spec.n_past]
+    future_rows = selected[spec.n_past:spec.n_past + spec.n_fut]
+    wp_rows = selected[spec.n_past:spec.n_past + spec.n_act]
+    current = selected[current_idx]
+
+    cache: dict[str, Path] = {}
+    past_cam = torch.stack(
+        [
+            preprocess_camera(
+                load_rgb_image(resolve_camera_path(sensor_path, row["filename_jpg"], cache)),
+                spec.image_size,
+            ).to(store_dtype)
+            for row in past_rows
+        ],
+        dim=0,
+    )
+    fut_cam = torch.stack(
+        [
+            preprocess_camera(
+                load_rgb_image(resolve_camera_path(sensor_path, row["filename_jpg"], cache)),
+                spec.image_size,
+            ).to(store_dtype)
+            for row in future_rows
+        ],
+        dim=0,
+    )
+
+    ref_xy = np.asarray([current["x"], current["y"]], dtype=np.float32)
+    ref_yaw = yaw_from_quaternion(current["qw"], current["qx"], current["qy"], current["qz"])
+    rot = rotation_world_to_local(ref_yaw)
+
+    ego_source = [selected[i] for i in resample_indices(spec.n_past, spec.n_ego)]
+    ego_rows = []
+    for row in ego_source:
+        xy = rot @ (np.asarray([row["x"], row["y"]], dtype=np.float32) - ref_xy)
+        yaw = yaw_from_quaternion(row["qw"], row["qx"], row["qy"], row["qz"]) - ref_yaw
+        vel = rot @ np.asarray([row["vx"], row["vy"]], dtype=np.float32)
+        acc = rot @ np.asarray([row["acceleration_x"], row["acceleration_y"]], dtype=np.float32)
+        ego_rows.append([xy[0], xy[1], yaw, vel[0], vel[1], acc[0], acc[1]][:spec.ego_dim])
+    ego = torch.as_tensor(np.asarray(ego_rows, dtype=np.float32), dtype=store_dtype)
+    ego[-1, 0:3] = 0
+
+    wp = []
+    for row in wp_rows:
+        xy = rot @ (np.asarray([row["x"], row["y"]], dtype=np.float32) - ref_xy)
+        wp.append(xy)
+    wp_gt = torch.as_tensor(np.asarray(wp, dtype=np.float32), dtype=store_dtype)
+
+    return {
+        "past_cam": past_cam,
+        "fut_cam": fut_cam,
+        "route": torch.zeros((spec.n_route, 2), dtype=store_dtype),
+        "ego": ego,
+        "wp_gt": wp_gt,
+        "meta": {
+            "token": db_path.stem,
+            "log_name": db_path.stem,
+            "map_name": "unknown",
+            "route_nonzero": False,
+        },
+    }
+
+
+def validate_sample_shapes(sample: dict, spec: FeatureSpec) -> dict[str, tuple]:
+    shapes = {k: tuple(v.shape) for k, v in sample.items() if hasattr(v, "shape")}
+    expected = {
+        "past_cam": (spec.n_past, 3, spec.image_size, spec.image_size),
+        "fut_cam": (spec.n_fut, 3, spec.image_size, spec.image_size),
+        "route": (spec.n_route, 2),
+        "ego": (spec.n_ego, spec.ego_dim),
+        "wp_gt": (spec.n_act, 2),
+    }
+    for key, exp in expected.items():
+        got = shapes.get(key)
+        assert got == exp, f"{key}: got {got}, expected {exp}"
+    return shapes
+
+
+def prepare_from_nuplan_dbs(args, spec: FeatureSpec, store_dtype: torch.dtype) -> bool:
+    db_files = sorted(Path(args.navsim_log_path).glob("*.db"))
+    if args.log_names:
+        names = {name.removesuffix(".db") for name in args.log_names}
+        db_files = [path for path in db_files if path.stem in names]
+    if args.max_scenes > 0:
+        db_files = db_files[: args.max_scenes]
+    if not db_files:
+        raise RuntimeError(f"no .db files found in {args.navsim_log_path}")
+
+    print(f"[prepare-db] split={args.split_name} dbs={len(db_files)}", flush=True)
+    sensor_path = Path(args.sensor_blobs_path)
+
+    if args.dry_run:
+        sample = build_db_sample(db_files[0], sensor_path, spec, store_dtype)
+        shapes = validate_sample_shapes(sample, spec)
+        print("[dry-run] sample shapes:", shapes, flush=True)
+        print("[dry-run] meta:", sample["meta"], flush=True)
+        print("[dry-run] OK — DB sample matches the model contract, no files written.", flush=True)
+        return True
+
+    split_dir = args.output_dir / args.split_name
+    split_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = args.output_dir / f"manifest_{args.split_name}.csv"
+    written = skipped = 0
+    wp_values: list[np.ndarray] = []
+
+    with manifest_path.open("w", newline="", encoding="utf-8") as f:
+        manifest = csv.DictWriter(f, fieldnames=["token", "log_name", "map_name", "route_nonzero"])
+        manifest.writeheader()
+        for db_path in db_files:
+            out_path = split_dir / f"{db_path.stem}.pt"
+            if out_path.exists() and not args.overwrite:
+                skipped += 1
+                continue
+            try:
+                sample = build_db_sample(db_path, sensor_path, spec, store_dtype)
+                validate_sample_shapes(sample, spec)
+            except Exception as exc:
+                print(f"[warn] skip {db_path.name}: {exc}", flush=True)
+                skipped += 1
+                continue
+            torch.save(sample, out_path)
+            manifest.writerow(sample["meta"])
+            wp_values.append(sample["wp_gt"].float().numpy())
+            written += 1
+
+    stats = {
+        "split": args.split_name,
+        "num_samples": written,
+        "num_skipped": skipped,
+        "route_nonzero_frac": 0.0,
+        "num_history_frames": args.num_history_frames,
+        "num_future_frames": args.num_future_frames,
+        "t_past": spec.n_past, "t_fut": spec.n_fut, "n_route": spec.n_route,
+        "n_ego": spec.n_ego, "n_act": spec.n_act, "ego_dim": spec.ego_dim,
+        "image_size": spec.image_size,
+        "source": "nuplan_db",
+    }
+    if wp_values:
+        wp = np.stack(wp_values, axis=0)
+        stats["wp_gt_mean"] = wp.mean(axis=(0, 1)).tolist()
+        stats["wp_gt_std"] = np.maximum(wp.std(axis=(0, 1)), 1e-6).tolist()
+    with (args.output_dir / f"stats_{args.split_name}.json").open("w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"[done] wrote {written} DB samples (skipped {skipped}) to {split_dir}", flush=True)
+    print("[warn] DB fallback writes zero route because route roadblocks are not available in raw DBs.", flush=True)
+    return True
+
+
+# --------------------------------------------------------------------------- #
 def parse_args():
     p = argparse.ArgumentParser(description="Prepare a NAVSIM cache (train/val parity with test).")
     p.add_argument("--navsim-log-path", required=True, help="navsim_logs/<split> dir (use trainval).")
@@ -197,6 +437,10 @@ def main():
               f"benchmark uses 4. Train/test will only match if this equals the eval "
               f"split's value. Set 4 unless you know the eval split differs.", flush=True)
 
+    if has_nuplan_db_logs(Path(args.navsim_log_path)):
+        prepare_from_nuplan_dbs(args, spec, store_dtype)
+        return
+
     scene_filter = build_scene_filter(args)
     loader = build_scene_loader(args, scene_filter, front_camera_sensor_config())
 
@@ -215,19 +459,9 @@ def main():
     if args.dry_run:
         scene = loader.get_scene_from_token(tokens[0])
         sample = build_training_sample(scene, spec, store_dtype=store_dtype)
-        shapes = {k: tuple(v.shape) for k, v in sample.items() if hasattr(v, "shape")}
+        shapes = validate_sample_shapes(sample, spec)
         print("[dry-run] sample shapes:", shapes, flush=True)
         print("[dry-run] meta:", sample["meta"], flush=True)
-        expected = {
-            "past_cam": (spec.n_past, 3, spec.image_size, spec.image_size),
-            "fut_cam": (spec.n_fut, 3, spec.image_size, spec.image_size),
-            "route": (spec.n_route, 2),
-            "ego": (spec.n_ego, spec.ego_dim),
-            "wp_gt": (spec.n_act, 2),
-        }
-        for k, exp in expected.items():
-            got = shapes.get(k)
-            assert got == exp, f"{k}: got {got}, expected {exp}"
         print("[dry-run] OK — shapes match the model contract, no files written.", flush=True)
         return
 

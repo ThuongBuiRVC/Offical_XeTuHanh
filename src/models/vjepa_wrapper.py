@@ -13,6 +13,10 @@ Notes:
 """
 from __future__ import annotations
 
+import sys
+import types
+from importlib import import_module
+
 import torch
 import torch.nn as nn
 
@@ -45,7 +49,7 @@ class VJEPAWrapper(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "vit_base",
+        model_name: str = "vjepa2_1_vit_base_384",
         img_size: int = 384,
         num_frames: int = 8,
         tubelet_size: int = 2,
@@ -76,6 +80,40 @@ class VJEPAWrapper(nn.Module):
         self.embed_dim: int = -1
         self._infer_dims()
 
+    def _load_from_hub(self, hub_repo: str, pretrained: bool):
+        """Load V-JEPA2 from torch hub without this repo's `src` package shadowing it."""
+        hub_repo_path = torch.hub._get_cache_or_reload(  # noqa: SLF001 - torch.hub has no public equivalent.
+            hub_repo,
+            force_reload=False,
+            trust_repo=True,
+            verbose=True,
+            skip_validation=True,
+        )
+        project_src_modules = {
+            name: module for name, module in sys.modules.items()
+            if name == "src" or name.startswith("src.")
+        }
+        try:
+            for name in list(project_src_modules):
+                sys.modules.pop(name, None)
+            vjepa_src = types.ModuleType("src")
+            vjepa_src.__path__ = [f"{hub_repo_path}/src"]
+            vjepa_src.__package__ = "src"
+            sys.modules["src"] = vjepa_src
+            sys.path.insert(0, hub_repo_path)
+            backbones = import_module("src.hub.backbones")
+            if getattr(backbones, "VJEPA_BASE_URL", "").startswith("http://localhost"):
+                backbones.VJEPA_BASE_URL = "https://dl.fbaipublicfiles.com/vjepa2"
+            loaded = getattr(backbones, self.model_name)(pretrained=pretrained)
+        finally:
+            sys.path = [path for path in sys.path if path != hub_repo_path]
+            for name in [name for name in sys.modules if name == "src" or name.startswith("src.")]:
+                sys.modules.pop(name, None)
+            sys.modules.update(project_src_modules)
+
+        # V-JEPA2 hub entries return (encoder, predictor). We only need frozen encoder tokens.
+        return loaded[0] if isinstance(loaded, tuple) else loaded
+
     def _load_encoder(self, pretrained: bool, hub_repo: str, force_fallback: bool = False) -> None:
         if force_fallback:
             self.encoder = _RandomViTFallback(
@@ -85,13 +123,16 @@ class VJEPAWrapper(nn.Module):
             print("[VJEPAWrapper] force_fallback=True; using random ViT stub.")
             return
         try:
-            self.encoder = torch.hub.load(hub_repo, self.model_name, pretrained=pretrained)
+            self.encoder = self._load_from_hub(hub_repo, pretrained)
             print(f"[VJEPAWrapper] Loaded {self.model_name} from {hub_repo}")
         except Exception as e:  # pragma: no cover - depends on network/hub
+            if pretrained:
+                raise RuntimeError(
+                    f"Failed to load pretrained V-JEPA from {hub_repo}:{self.model_name}. "
+                    "Set vjepa.force_fallback=true only for smoke/offline tests."
+                ) from e
             print(f"[VJEPAWrapper] hub load failed ({e}); using random ViT fallback.")
-            self.encoder = _RandomViTFallback(
-                self._expected_dim, self.patch_size, self.tubelet_size
-            )
+            self.encoder = _RandomViTFallback(self._expected_dim, self.patch_size, self.tubelet_size)
             self.is_fallback = True
 
     @torch.no_grad()
