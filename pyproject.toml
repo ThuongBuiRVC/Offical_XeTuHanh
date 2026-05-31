@@ -1,0 +1,27 @@
+[project]
+name = "driving-world-model"
+version = "0.1.0"
+description = "DiT + Shortcut Flow Matching driving world model (DreamZero-style joint training)"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.6",
+    "pyyaml>=6.0",
+    "numpy",
+    "opencv-python",
+    "pytest",
+    "tensorboard",
+]
+
+# Install torch CUDA build with:
+#   uv venv --python 3.12 .venv
+#   VIRTUAL_ENV=.venv uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cu124
+#   VIRTUAL_ENV=.venv uv pip install --python .venv/bin/python -e .
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -p no:cacheprovider: avoid .pytest_cache writes
+# The ROS Kilted PYTHONPATH (/opt/ros/kilted) leaks plugins (launch_testing -> lark)
+# that fail to import. Run tests with PYTHONPATH cleared:
+#   PYTHONPATH= .venv/bin/python -m pytest
+# or with autoload disabled: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+addopts = "-p no:cacheprovider -p no:launch_testing -p no:launch_pytest"

@@ -1,0 +1,86 @@
+# Joint Training config — Driving World Model (DiT + Shortcut Flow Matching)
+# Single-stage joint training (see SPEC.md §9). One config, no phase1/phase2.
+
+seed: 42
+device: cuda
+out_dir: logs
+
+# ---------------- Dimensions (SPEC §1) ----------------
+dims:
+  embed_dim: 768        # D, matches V-JEPA 2.1 ViT-B
+  t_past: 8             # past frames (2 Hz x 3.5s)
+  t_fut: 8              # future frames (2 Hz x 4s)
+  n_route: 20           # route waypoints in the current ego frame
+  n_ego: 8              # ego history steps
+  n_act: 8              # future waypoints to predict
+  ego_dim: 7            # x, y, yaw, vx, vy, ax, ay in the current ego frame
+
+# ---------------- V-JEPA backbone (SPEC §2, FROZEN) ----------------
+vjepa:
+  model_name: vit_base            # V-JEPA 2.1 ViT-B/16
+  img_size: 384
+  num_frames: 8
+  tubelet_size: 2
+  patch_size: 16
+  pretrained: true
+  hub_repo: facebookresearch/vjepa2
+  # n_v is inferred dynamically at init (do NOT hardcode). Expected 2304 @384/8f/p16/tube2.
+
+# ---------------- DiT backbone (SPEC §6) ----------------
+dit:
+  num_layers: 8
+  num_heads: 12          # head_dim = 64
+  mlp_ratio: 4.0
+  qk_norm: true
+  rope: true
+
+# ---------------- Flow matching + shortcut (SPEC §7) ----------------
+flow:
+  shortcut_frac: 0.25                          # 25% of samples get d>0
+  d_values: [0.0078125, 0.015625, 0.03125, 0.0625, 0.125, 0.25, 0.5]  # 1/128 .. 1/2
+
+# ---------------- Loss weights (SPEC §9.4) ----------------
+loss:
+  lambda_a: 1.0
+  lambda_wp: 5.0
+  lambda_smooth: 0.1
+  lambda_sc: 1.0
+  huber_beta: 0.5
+
+# ---------------- Optimizer / schedule (SPEC §9.5) ----------------
+optim:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.05
+  warmup_steps: 2000
+  max_steps: 100000
+  grad_clip: 1.0
+  grad_accum: 4
+  amp_dtype: bf16
+  ema_decay: 0.9999
+
+# ---------------- Data ----------------
+data:
+  batch_size: 4
+  num_workers: 4
+  use_placeholder: false
+  cache_root: Data/nuplan_cache
+  # Set use_placeholder=true only for plumbing/debug runs without prepared NuPlan data.
+  placeholder_train_size: 256
+  placeholder_val_size: 32
+  route_lookahead_m: 80.0   # route polyline length (m); shared by prepare + eval agent
+
+# ---------------- Inference (SPEC §10) ----------------
+inference:
+  ode_steps: 4
+  solver: euler          # euler | heun
+
+# ---------------- Logging / checkpoint / validation ----------------
+log:
+  log_every: 50
+  val_every: 1000
+  ckpt_every: 5000
+  val_batches: 8
+  open_loop_batches: 8
+  viz_every: 2000
+  viz_batch: 2
